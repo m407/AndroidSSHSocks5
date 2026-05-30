@@ -1,0 +1,6 @@
+{
+  "name": "SSH SOCKS5 Proxy",
+  "description": "Configurable SOCKS5 proxy app over SSH tunnel forwarding with credential or key-based authentication.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
