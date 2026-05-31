@@ -103,23 +103,6 @@ fun ProxyAppContent(viewModel: SshProxyViewModel) {
     var showFormDialog by remember { mutableStateOf(false) }
     var editingProfile by remember { mutableStateOf<SshProfile?>(null) }
 
-    // Prepopulate a sample profile when empty to guide the user
-    LaunchedEffect(profiles) {
-        if (profiles.isEmpty()) {
-            viewModel.saveProfile(
-                SshProfile(
-                    name = "Sample VPS Profile",
-                    host = "192.168.1.100",
-                    port = 22,
-                    username = "root",
-                    authType = "PASSWORD",
-                    password = "mypassword",
-                    socksPort = 1080
-                )
-            )
-        }
-    }
-
     Scaffold(
         topBar = {
             TopAppBar(
@@ -672,6 +655,7 @@ fun ProfileFormDialog(
 
     var passwordVisible by remember { mutableStateOf(false) }
     var passphraseVisible by remember { mutableStateOf(false) }
+    var validationError by remember { mutableStateOf<String?>(null) }
 
     Dialog(onDismissRequest = onDismiss) {
         Card(
@@ -803,7 +787,7 @@ fun ProfileFormDialog(
                             ),
                             shape = RoundedCornerShape(8.dp)
                         ) {
-                            Text("RSA Private Key", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("Private Key", fontSize = 11.sp, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
@@ -893,6 +877,15 @@ fun ProfileFormDialog(
                     )
                 )
 
+                validationError?.let { error ->
+                    Text(
+                        text = error,
+                        color = Color(0xFFFF5252),
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp
+                    )
+                }
+
                 Spacer(modifier = Modifier.height(8.dp))
 
                 // Actions row
@@ -914,23 +907,33 @@ fun ProfileFormDialog(
 
                     Button(
                         onClick = {
-                            if (name.isBlank() || host.isBlank() || username.isBlank()) {
+                            val pInt = port.toIntOrNull()
+                            val sInt = socksPort.toIntOrNull()
+                            validationError = when {
+                                name.isBlank() -> "Profile name is required."
+                                host.isBlank() -> "SSH host name or IP address is required."
+                                username.isBlank() -> "Username is required."
+                                pInt == null || pInt !in 1..65535 -> "SSH port must be between 1 and 65535."
+                                sInt == null || sInt !in 1024..65535 -> "SOCKS5 bind port must be between 1024 and 65535."
+                                authType == "PASSWORD" && password.isEmpty() -> "SSH password is required for password authentication."
+                                authType == "KEY" && privateKey.isBlank() -> "Private key is required for key authentication."
+                                else -> null
+                            }
+                            if (validationError != null) {
                                 return@Button
                             }
-                            val pInt = port.toIntOrNull() ?: 22
-                            val sInt = socksPort.toIntOrNull() ?: 1080
                             onSave(
                                 SshProfile(
                                     id = profile?.id ?: 0,
                                     name = name.trim(),
                                     host = host.trim(),
-                                    port = pInt,
+                                    port = pInt!!,
                                     username = username.trim(),
                                     authType = authType,
                                     password = password,
                                     privateKey = privateKey.trim(),
                                     passphrase = passphrase,
-                                    socksPort = sInt
+                                    socksPort = sInt!!
                                 )
                             )
                         },

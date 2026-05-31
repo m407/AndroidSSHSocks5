@@ -16,13 +16,26 @@ import com.example.data.AppDatabase
 import com.example.data.SshProfile
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class SshProxyService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val connectionMutex = Mutex()
+    private var connectionJob: Job? = null
     private var sshSession: Session? = null
     private var localSocks5Proxy: LocalSocks5Proxy? = null
 
@@ -69,21 +82,46 @@ class SshProxyService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action
-        if (action == ACTION_START) {
-            val profileId = intent.getIntExtra(EXTRA_PROFILE_ID, -1)
-            startForeground(NOTIFICATION_ID, createNotification("SOCKS5 over SSH", "Starting proxy..."))
-            if (profileId != -1) {
-                launchSshProxy(profileId)
-            } else {
-                _status.value = ProxyStatus.ERROR
-                _lastError.value = "Invalid profile ID"
-                stopSelf()
+        when (intent?.action) {
+            ACTION_START -> {
+                val profileId = intent.getIntExtra(EXTRA_PROFILE_ID, -1)
+                startForeground(NOTIFICATION_ID, createNotification("SOCKS5 over SSH", "Starting proxy..."))
+                if (profileId == -1) {
+                    _status.value = ProxyStatus.ERROR
+                    _lastError.value = "Invalid profile ID"
+                    stopSelf()
+                } else {
+                    startConnection(profileId)
+                }
             }
-        } else if (action == ACTION_STOP) {
-            stopProxyService()
+            ACTION_STOP -> stopConnection()
         }
         return START_NOT_STICKY
+    }
+
+    private fun startConnection(profileId: Int) {
+        val previousJob = connectionJob
+        connectionJob = serviceScope.launch {
+            previousJob?.cancelAndJoin()
+            connectionMutex.withLock {
+                cleanupConnection()
+                runSshProxy(profileId)
+            }
+        }
+    }
+
+    private fun stopConnection() {
+        val jobToStop = connectionJob
+        serviceScope.launch {
+            jobToStop?.cancelAndJoin()
+            connectionMutex.withLock {
+                cleanupConnection()
+                _status.value = ProxyStatus.DISCONNECTED
+                _activeProfile.value = null
+                updateNotification("SOCKS5 Proxy Stopped", "Proxy disconnected")
+                stopSelf()
+            }
+        }
     }
 
     private fun createNotificationChannel() {
@@ -111,7 +149,6 @@ class SshProxyService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(content)
-            // Use standard Android icon because we guaranteed it exists
             .setSmallIcon(android.R.drawable.stat_sys_phone_call)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -119,81 +156,89 @@ class SshProxyService : Service() {
             .build()
     }
 
-    private fun launchSshProxy(profileId: Int) {
-        serviceScope.launch {
-            _status.value = ProxyStatus.CONNECTING
-            _lastError.value = null
+    private suspend fun runSshProxy(profileId: Int) {
+        _status.value = ProxyStatus.CONNECTING
+        _lastError.value = null
 
-            // Retrieve profile from Database
-            val db = AppDatabase.getDatabase(applicationContext)
-            val profile = db.sshProfileDao().getProfileById(profileId)
-            if (profile == null) {
-                _status.value = ProxyStatus.ERROR
-                _lastError.value = "SOCKS5 profile not found in DB."
-                updateNotification("Connection Failed", "Profile not found")
-                stopSelf()
-                return@launch
+        val profile = AppDatabase.getDatabase(applicationContext)
+            .sshProfileDao()
+            .getProfileById(profileId)
+
+        if (profile == null) {
+            _status.value = ProxyStatus.ERROR
+            _lastError.value = "SOCKS5 profile not found in DB."
+            updateNotification("Connection Failed", "Profile not found")
+            stopSelf()
+            return
+        }
+
+        _activeProfile.value = profile
+        updateNotification("Connecting to SSH...", "${profile.host}:${profile.port}")
+
+        try {
+            validateProfile(profile)
+
+            val jsch = JSch().apply {
+                hostKeyRepository = TofuHostKeyRepository(applicationContext)
+            }
+            if (profile.authType == "KEY") {
+                val privateKeyBytes = profile.privateKey.toByteArray(Charsets.UTF_8)
+                val passphraseBytes = profile.passphrase
+                    .takeIf { it.isNotEmpty() }
+                    ?.toByteArray(Charsets.UTF_8)
+                jsch.addIdentity("profile_${profile.id}", privateKeyBytes, null, passphraseBytes)
             }
 
-            _activeProfile.value = profile
-            updateNotification("Connecting to SSH...", "${profile.host}:${profile.port}")
+            val session = jsch.getSession(profile.username, profile.host, profile.port)
+            sshSession = session
 
-            try {
-                val jsch = JSch()
-
-                if (profile.authType == "KEY" && profile.privateKey.isNotEmpty()) {
-                    val privateKeyBytes = profile.privateKey.toByteArray(Charsets.UTF_8)
-                    val passphraseBytes = if (profile.passphrase.isNotEmpty()) {
-                        profile.passphrase.toByteArray(Charsets.UTF_8)
-                    } else {
-                        null
-                    }
-                    jsch.addIdentity("profile_${profile.id}", privateKeyBytes, null, passphraseBytes)
-                }
-
-                val session = jsch.getSession(profile.username, profile.host, profile.port)
-                sshSession = session
-
-                if (profile.authType == "PASSWORD" && profile.password.isNotEmpty()) {
-                    session.setPassword(profile.password)
-                }
-
-                session.setConfig("StrictHostKeyChecking", "no")
-                session.setConfig("PreferredAuthentications", "publickey,keyboard-interactive,password")
-
-                // Add keepalive to make connection robust
-                session.setServerAliveInterval(30000) // 30 seconds
-                session.setServerAliveCountMax(3)
-
-                session.connect(15000) // Timeout 15s
-
-                // Bind to SOCKS5 dynamic port forwarding using custom localized SOCKS5 proxy
-                localSocks5Proxy = LocalSocks5Proxy(profile.socksPort) { sshSession }.apply {
-                    start()
-                }
-
-                _status.value = ProxyStatus.CONNECTED
-                updateNotification(
-                    "SOCKS5 Proxy Active",
-                    "Local Port: ${profile.socksPort} | Tunnel: ${profile.host}"
-                )
-
-                // Wait or monitor the session.
-                while (isActive && session.isConnected) {
-                    delay(2000)
-                }
-
-                if (!session.isConnected && _status.value == ProxyStatus.CONNECTED) {
-                    throw Exception("SSH Connection lost unexpectedly")
-                }
-
-            } catch (e: Exception) {
-                Log.e("SshProxyService", "Error during SSH proxy execution", e)
-                _status.value = ProxyStatus.ERROR
-                _lastError.value = e.localizedMessage ?: e.message ?: "Unknown SSH connection error"
-                updateNotification("Connection Error", _lastError.value ?: "Unknown error")
-                stopSelf()
+            if (profile.authType == "PASSWORD") {
+                session.setPassword(profile.password)
             }
+
+            session.setConfig("StrictHostKeyChecking", "yes")
+            session.setConfig("PreferredAuthentications", "publickey,keyboard-interactive,password")
+            session.setServerAliveInterval(30_000)
+            session.setServerAliveCountMax(3)
+            session.connect(15_000)
+
+            localSocks5Proxy = LocalSocks5Proxy(profile.socksPort) { sshSession }.apply {
+                start()
+            }
+
+            _status.value = ProxyStatus.CONNECTED
+            updateNotification(
+                "SOCKS5 Proxy Active",
+                "Local Port: ${profile.socksPort} | Tunnel: ${profile.host}"
+            )
+
+            while (currentCoroutineContext().isActive && session.isConnected) {
+                delay(2_000)
+            }
+
+            if (!session.isConnected && _status.value == ProxyStatus.CONNECTED) {
+                throw IllegalStateException("SSH connection lost unexpectedly")
+            }
+        } catch (e: Exception) {
+            if (!currentCoroutineContext().isActive) return
+            Log.e("SshProxyService", "Error during SSH proxy execution", e)
+            cleanupConnection()
+            _status.value = ProxyStatus.ERROR
+            _lastError.value = e.localizedMessage ?: e.message ?: "Unknown SSH connection error"
+            updateNotification("Connection Error", _lastError.value ?: "Unknown error")
+            stopSelf()
+        }
+    }
+
+    private fun validateProfile(profile: SshProfile) {
+        require(profile.host.isNotBlank()) { "SSH host is required" }
+        require(profile.username.isNotBlank()) { "SSH username is required" }
+        require(profile.port in 1..65535) { "SSH port must be between 1 and 65535" }
+        require(profile.socksPort in 1024..65535) { "SOCKS5 port must be between 1024 and 65535" }
+        when (profile.authType) {
+            "PASSWORD" -> require(profile.password.isNotEmpty()) { "SSH password is required" }
+            "KEY" -> require(profile.privateKey.isNotBlank()) { "SSH private key is required" }
+            else -> error("Unsupported authentication type: ${profile.authType}")
         }
     }
 
@@ -202,11 +247,7 @@ class SshProxyService : Service() {
         notificationManager.notify(NOTIFICATION_ID, createNotification(title, content))
     }
 
-    private fun stopProxyService() {
-        _status.value = ProxyStatus.DISCONNECTED
-        _activeProfile.value = null
-        serviceScope.coroutineContext.cancelChildren()
-
+    private fun cleanupConnection() {
         try {
             localSocks5Proxy?.stop()
         } catch (e: Exception) {
@@ -220,11 +261,14 @@ class SshProxyService : Service() {
             Log.e("SshProxyService", "Error disconnecting session", e)
         }
         sshSession = null
-        stopSelf()
     }
 
     override fun onDestroy() {
-        stopProxyService()
+        connectionJob?.cancel()
+        cleanupConnection()
+        _status.value = ProxyStatus.DISCONNECTED
+        _activeProfile.value = null
+        serviceScope.cancel()
         super.onDestroy()
     }
 
